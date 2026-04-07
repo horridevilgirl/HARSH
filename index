@@ -1,0 +1,318 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const STEPS = 16;
+const BPM_DEFAULT = 160;
+
+const INSTRUMENTS = [
+  { id: "kick",   label: "KICK",  color: "#e24b4a" },
+  { id: "snare",  label: "SNARE", color: "#ba7517" },
+  { id: "hat",    label: "HAT",   color: "#888780" },
+  { id: "bass",   label: "BASS",  color: "#533ab7" },
+  { id: "synth",  label: "SYNTH", color: "#1d9e75" },
+  { id: "noise",  label: "NOISE", color: "#d4537e" },
+  { id: "guitar", label: "FUZZ",  color: "#378add" },
+];
+
+function makePattern() {
+  return INSTRUMENTS.reduce((acc, inst) => {
+    acc[inst.id] = Array(STEPS).fill(false);
+    return acc;
+  }, {});
+}
+
+function randomPattern() {
+  return INSTRUMENTS.reduce((acc, inst) => {
+    acc[inst.id] = Array(STEPS).fill(false).map(() => Math.random() < 0.25);
+    return acc;
+  }, {});
+}
+
+export default function App() {
+  const [patterns, setPatterns] = useState([makePattern(), makePattern()]);
+  const [editPat, setEditPat] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [globalStep, setGlobalStep] = useState(-1);
+  const [bpm, setBpm] = useState(BPM_DEFAULT);
+  const [distortion, setDistortion] = useState(0.7);
+  const [volume, setVolume] = useState(0.8);
+  const [pitchShift, setPitchShift] = useState(0);
+
+  const audioCtx = useRef(null);
+  const intervalRef = useRef(null);
+  const globalStepRef = useRef(-1);
+  const patternsRef = useRef(patterns);
+  patternsRef.current = patterns;
+
+  const totalSteps = patterns.length * STEPS;
+
+  function getCtx() {
+    if (!audioCtx.current) audioCtx.current = new (window.AudioContext || window.webkitAudioContext)();
+    return audioCtx.current;
+  }
+
+  function makeDistortionCurve(amount) {
+    const samples = 256, curve = new Float32Array(samples);
+    for (let i = 0; i < samples; i++) {
+      const x = (i * 2) / samples - 1;
+      curve[i] = ((Math.PI + amount * 400) * x) / (Math.PI + amount * 400 * Math.abs(x));
+    }
+    return curve;
+  }
+
+  function playSound(id, ctx, when, dist, vol, pitch) {
+    const master = ctx.createGain();
+    master.gain.value = vol;
+    const wave = ctx.createWaveShaper();
+    wave.curve = makeDistortionCurve(dist);
+    wave.oversample = "4x";
+
+    const noteFreq = (base) => base * Math.pow(2, pitch / 12);
+
+    if (id === "kick") {
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(180, when);
+      osc.frequency.exponentialRampToValueAtTime(30, when + 0.15);
+      gain.gain.setValueAtTime(2.5, when);
+      gain.gain.exponentialRampToValueAtTime(0.001, when + 0.25);
+      osc.connect(gain); gain.connect(wave); wave.connect(master); master.connect(ctx.destination);
+      osc.start(when); osc.stop(when + 0.3);
+    } else if (id === "snare") {
+      const buf = ctx.createBuffer(1, ctx.sampleRate * 0.15, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = (Math.random()*2-1)*Math.pow(1-i/data.length,1.5)*2;
+      const src = ctx.createBufferSource(), gain = ctx.createGain();
+      src.buffer = buf;
+      gain.gain.setValueAtTime(1.5, when);
+      gain.gain.exponentialRampToValueAtTime(0.001, when + 0.15);
+      src.connect(gain); gain.connect(wave); wave.connect(master); master.connect(ctx.destination);
+      src.start(when);
+    } else if (id === "hat") {
+      const buf = ctx.createBuffer(1, ctx.sampleRate * 0.06, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = (Math.random()*2-1)*Math.pow(1-i/data.length,2);
+      const src = ctx.createBufferSource(), filt = ctx.createBiquadFilter(), gain = ctx.createGain();
+      src.buffer = buf; filt.type = "highpass"; filt.frequency.value = 7000;
+      gain.gain.setValueAtTime(0.8, when);
+      src.connect(filt); filt.connect(gain); gain.connect(master); master.connect(ctx.destination);
+      src.start(when);
+    } else if (id === "bass") {
+      const osc = ctx.createOscillator(), gain = ctx.createGain();
+      osc.type = "sawtooth"; osc.frequency.value = noteFreq(65.4);
+      gain.gain.setValueAtTime(1.5, when);
+      gain.gain.exponentialRampToValueAtTime(0.001, when + 0.2);
+      osc.connect(gain); gain.connect(wave); wave.connect(master); master.connect(ctx.destination);
+      osc.start(when); osc.stop(when + 0.25);
+    } else if (id === "synth") {
+      const o1 = ctx.createOscillator(), o2 = ctx.createOscillator(), gain = ctx.createGain();
+      o1.type = "sawtooth"; o2.type = "square";
+      o1.frequency.value = noteFreq(261.6); o2.frequency.value = noteFreq(261.6)*1.01;
+      gain.gain.setValueAtTime(1.2, when);
+      gain.gain.exponentialRampToValueAtTime(0.001, when + 0.18);
+      o1.connect(gain); o2.connect(gain); gain.connect(wave); wave.connect(master); master.connect(ctx.destination);
+      o1.start(when); o1.stop(when+0.2); o2.start(when); o2.stop(when+0.2);
+    } else if (id === "noise") {
+      const buf = ctx.createBuffer(1, ctx.sampleRate*0.3, ctx.sampleRate);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) data[i] = (Math.random()*2-1)*1.5;
+      const src = ctx.createBufferSource(), gain = ctx.createGain();
+      src.buffer = buf;
+      gain.gain.setValueAtTime(1.0, when);
+      gain.gain.exponentialRampToValueAtTime(0.001, when+0.3);
+      src.connect(gain); gain.connect(wave); wave.connect(master); master.connect(ctx.destination);
+      src.start(when);
+    } else if (id === "guitar") {
+      const osc = ctx.createOscillator(), fuzz = ctx.createWaveShaper(), gain = ctx.createGain();
+      osc.type = "sawtooth"; osc.frequency.value = noteFreq(164.8);
+      fuzz.curve = makeDistortionCurve(Math.min(dist+0.3,1));
+      gain.gain.setValueAtTime(1.8, when);
+      gain.gain.exponentialRampToValueAtTime(0.001, when+0.22);
+      osc.connect(fuzz); fuzz.connect(gain); gain.connect(wave); wave.connect(master); master.connect(ctx.destination);
+      osc.start(when); osc.stop(when+0.25);
+    }
+  }
+
+  const distRef = useRef(distortion);
+  const volRef = useRef(volume);
+  const pitchRef = useRef(pitchShift);
+  distRef.current = distortion; volRef.current = volume; pitchRef.current = pitchShift;
+
+  const tick = useCallback(() => {
+    const ctx = getCtx();
+    globalStepRef.current = (globalStepRef.current + 1) % (patternsRef.current.length * STEPS);
+    setGlobalStep(globalStepRef.current);
+    const gs = globalStepRef.current;
+    const patIdx = Math.floor(gs / STEPS);
+    const s = gs % STEPS;
+    const pat = patternsRef.current[patIdx];
+    if (pat) {
+      INSTRUMENTS.forEach(({ id }) => {
+        if (pat[id][s]) playSound(id, ctx, ctx.currentTime, distRef.current, volRef.current, pitchRef.current);
+      });
+    }
+  }, []);
+
+  const tickRef = useRef(tick);
+  tickRef.current = tick;
+
+  useEffect(() => {
+    if (playing) {
+      intervalRef.current = setInterval(() => tickRef.current(), (60/bpm/4)*1000);
+    } else {
+      clearInterval(intervalRef.current);
+      setGlobalStep(-1);
+      globalStepRef.current = -1;
+    }
+    return () => clearInterval(intervalRef.current);
+  }, [playing, bpm]);
+
+  function toggleCell(instId, s) {
+    setPatterns(ps => ps.map((p, pi) => pi !== editPat ? p : { ...p, [instId]: p[instId].map((v,i)=>i===s?!v:v) }));
+  }
+
+  function addPattern() {
+    setPatterns(ps => [...ps, makePattern()]);
+    setEditPat(patterns.length);
+  }
+
+  function removePattern(idx) {
+    if (patterns.length <= 1) return;
+    setPatterns(ps => ps.filter((_,i)=>i!==idx));
+    setEditPat(e => Math.min(e, patterns.length-2));
+  }
+
+  function randomizePat(idx) {
+    setPatterns(ps => ps.map((p,i)=>i===idx?randomPattern():p));
+  }
+
+  function clearPat(idx) {
+    setPatterns(ps => ps.map((p,i)=>i===idx?makePattern():p));
+  }
+
+  const activePat = Math.floor(Math.max(globalStep,0) / STEPS);
+  const activeStep = globalStep % STEPS;
+
+  return (
+    <div style={{fontFamily:"var(--font-mono,monospace)",padding:"1.5rem 1rem",maxWidth:820,margin:"0 auto"}}>
+      <div style={{marginBottom:"1.5rem"}}>
+        <div style={{display:"flex",alignItems:"baseline",gap:14}}>
+          <span style={{fontSize:20,fontWeight:500,letterSpacing:"0.12em",color:"var(--color-text-primary)"}}>HARSH</span>
+          <span style={{fontSize:11,color:"var(--color-text-secondary)",letterSpacing:"0.1em"}}>BLOCK SEQUENCER</span>
+        </div>
+        <div style={{fontSize:11,color:"var(--color-text-secondary)",letterSpacing:"0.08em",marginTop:3,fontStyle:"italic"}}>for cam, with love</div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:10,marginBottom:"1.5rem"}}>
+        {[
+          {label:"BPM",     val:bpm,                        set:setBpm,            min:80,  max:280, step:1},
+          {label:"DISTORT", val:Math.round(distortion*100), set:v=>setDistortion(v/100), min:0, max:100, step:1},
+          {label:"VOLUME",  val:Math.round(volume*100),     set:v=>setVolume(v/100),     min:0, max:100, step:1},
+          {label:"PITCH",   val:pitchShift,                 set:setPitchShift,     min:-12, max:12,  step:1},
+        ].map(({label,val,set,min,max,step:s})=>(
+          <div key={label} style={{background:"var(--color-background-secondary)",borderRadius:"var(--border-radius-md)",padding:"10px 12px",border:"0.5px solid var(--color-border-tertiary)"}}>
+            <div style={{fontSize:10,color:"var(--color-text-secondary)",letterSpacing:"0.1em",marginBottom:6}}>{label}</div>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <input type="range" min={min} max={max} step={s} value={val} onChange={e=>set(Number(e.target.value))} style={{flex:1}}/>
+              <span style={{fontSize:13,fontWeight:500,minWidth:28,textAlign:"right",color:"var(--color-text-primary)"}}>{val}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:"flex",gap:6,alignItems:"center",marginBottom:"1rem",flexWrap:"wrap"}}>
+        <span style={{fontSize:10,color:"var(--color-text-secondary)",letterSpacing:"0.1em",marginRight:4}}>PATTERNS</span>
+        {patterns.map((_, pi) => {
+          const isActive = playing && activePat === pi;
+          const isEdit = editPat === pi;
+          return (
+            <div key={pi} style={{display:"flex",alignItems:"center",gap:0}}>
+              <button
+                onClick={()=>setEditPat(pi)}
+                style={{
+                  padding:"5px 12px",fontSize:11,letterSpacing:"0.08em",
+                  border:`0.5px solid ${isActive?"#e24b4a":isEdit?"var(--color-border-primary)":"var(--color-border-secondary)"}`,
+                  borderRight:"none",
+                  borderRadius:"4px 0 0 4px",cursor:"pointer",
+                  background: isActive?"#e24b4a22": isEdit?"var(--color-background-secondary)":"transparent",
+                  color: isActive?"#e24b4a": isEdit?"var(--color-text-primary)":"var(--color-text-secondary)",
+                  fontFamily:"var(--font-mono,monospace)",
+                  fontWeight: isEdit?500:400,
+                }}
+              >{String(pi+1).padStart(2,"0")}</button>
+              <button
+                onClick={()=>removePattern(pi)}
+                style={{
+                  padding:"5px 7px",fontSize:11,
+                  border:"0.5px solid var(--color-border-secondary)",
+                  borderRadius:"0 4px 4px 0",cursor:"pointer",
+                  background:"transparent",color:"var(--color-text-secondary)",
+                  fontFamily:"var(--font-mono,monospace)",
+                  opacity: patterns.length<=1?0.3:1,
+                }}
+              >×</button>
+            </div>
+          );
+        })}
+        <button
+          onClick={addPattern}
+          style={{padding:"5px 10px",fontSize:11,border:"0.5px dashed var(--color-border-secondary)",borderRadius:4,cursor:"pointer",background:"transparent",color:"var(--color-text-secondary)",fontFamily:"var(--font-mono,monospace)",letterSpacing:"0.08em"}}
+        >+ ADD</button>
+      </div>
+
+      <div style={{overflowX:"auto",marginBottom:"1rem"}}>
+        <div style={{display:"flex",alignItems:"center",gap:3,marginBottom:6,paddingLeft:68}}>
+          {Array(STEPS).fill(0).map((_,i)=>(
+            <div key={i} style={{width:28,textAlign:"center",fontSize:9,color:i%4===0?"var(--color-text-secondary)":"var(--color-text-tertiary,#999)",flexShrink:0}}>
+              {i%4===0?i+1:"·"}
+            </div>
+          ))}
+        </div>
+
+        {INSTRUMENTS.map(inst=>(
+          <div key={inst.id} style={{display:"flex",alignItems:"center",gap:3,marginBottom:3}}>
+            <div style={{width:62,flexShrink:0,fontSize:10,fontWeight:500,letterSpacing:"0.08em",padding:"4px 6px",borderRadius:4,border:`0.5px solid ${inst.color}44`,color:inst.color,textAlign:"center",userSelect:"none"}}>
+              {inst.label}
+            </div>
+            {Array(STEPS).fill(0).map((_,s)=>{
+              const on = patterns[editPat]?.[inst.id]?.[s];
+              const isPlayHead = playing && activePat===editPat && activeStep===s;
+              const isPlayHeadOther = playing && activePat!==editPat;
+              return (
+                <div
+                  key={s}
+                  onClick={()=>toggleCell(inst.id,s)}
+                  style={{
+                    width:28,height:28,flexShrink:0,borderRadius:3,cursor:"pointer",
+                    border:`0.5px solid ${on?inst.color:inst.color+"33"}`,
+                    background: isPlayHead?(on?inst.color:"var(--color-background-secondary)"): on?inst.color+"cc":"transparent",
+                    boxShadow: isPlayHead&&on?`0 0 0 2px ${inst.color}55`:"none",
+                    opacity: isPlayHeadOther?0.6:1,
+                    transition:"background 0.05s",
+                    outline: s%4===0?`1px solid ${inst.color}18`:"none",
+                    outlineOffset:1,
+                  }}
+                />
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:"1rem"}}>
+        <button
+          onClick={()=>{getCtx();setPlaying(p=>!p)}}
+          style={{padding:"8px 24px",fontSize:12,letterSpacing:"0.12em",fontWeight:500,border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",cursor:"pointer",background:playing?"#e24b4a":"transparent",color:playing?"#fff":"var(--color-text-primary)",fontFamily:"var(--font-mono,monospace)"}}
+        >{playing?"■ STOP":"▶ PLAY"}</button>
+        <button onClick={()=>randomizePat(editPat)} style={{padding:"8px 14px",fontSize:12,letterSpacing:"0.1em",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",cursor:"pointer",background:"transparent",color:"var(--color-text-secondary)",fontFamily:"var(--font-mono,monospace)"}}>RANDOM</button>
+        <button onClick={()=>clearPat(editPat)} style={{padding:"8px 14px",fontSize:12,letterSpacing:"0.1em",border:"0.5px solid var(--color-border-secondary)",borderRadius:"var(--border-radius-md)",cursor:"pointer",background:"transparent",color:"var(--color-text-secondary)",fontFamily:"var(--font-mono,monospace)"}}>CLEAR</button>
+        <div style={{marginLeft:"auto",fontSize:10,color:"var(--color-text-tertiary,#aaa)",letterSpacing:"0.08em"}}>
+          {playing?`PAT ${activePat+1}  STEP ${activeStep+1}/${STEPS}`:"STOPPED"}
+        </div>
+      </div>
+
+      <div style={{padding:"10px 12px",border:"0.5px solid var(--color-border-tertiary)",borderRadius:"var(--border-radius-md)",fontSize:11,color:"var(--color-text-secondary)",lineHeight:1.7,letterSpacing:"0.04em"}}>
+        patterns play in sequence · click a pattern number to edit it · × removes · + ADD chains a new 16-step pattern
+      </div>
+    </div>
+  );
+}
